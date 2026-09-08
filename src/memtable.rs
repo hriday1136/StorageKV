@@ -65,6 +65,10 @@ impl MemTable {
     pub fn iter(&self) -> impl Iterator<Item = (&Vec<u8>, &Entry)> {
         self.map.iter()
     }
+
+    pub fn lookup(&self, key: &[u8]) -> Option<(Kind, Vec<u8>)> {
+        self.map.get(key).map(|e| (e.kind.clone(), e.value.clone()))
+    }
 }
 
 fn entry_size(key: &[u8], entry: &Entry) -> usize {

@@ -91,6 +91,7 @@ pub struct SSTable {
     file: File,
     index: Vec<(Vec<u8>, u64)>, // sorted by key: (indexed key, data offset)
     index_offset: u64,
+    max_seq: u64
 }
 
 impl SSTable {
@@ -133,7 +134,16 @@ impl SSTable {
             index.push((key, u64::from_le_bytes(off_buf)));
         }
 
-        Ok(SSTable { file, index, index_offset })
+        file.seek(SeekFrom::Start(0))?;
+        let mut data = vec![0u8; index_offset as usize];
+        file.read_exact(&mut data)?;
+        let mut max_seq = 0u64;
+        let mut cur = Cursor::new(data);
+        while let Some(rec) = Record::decode(&mut cur)? {
+            max_seq = max_seq.max(rec.seq);
+        }
+
+        Ok(SSTable { file, index, index_offset, max_seq })
     }
 
     /// Look up a key in the SSTable
@@ -178,6 +188,10 @@ impl SSTable {
             }
         }
         Ok(None)
+    }
+
+    pub fn max_seq(&self) -> u64 {
+        self.max_seq
     }
 }
 

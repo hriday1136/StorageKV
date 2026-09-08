@@ -5,7 +5,7 @@
 use crate::error::Result;
 use crate::record::Record;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Write, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 pub struct Wal {
@@ -40,6 +40,13 @@ impl Wal {
             records.push(record);
         }
         Ok(records)
+    }
+
+    pub fn reset(&mut self) -> Result<()> {
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.sync_all()?;
+        Ok(())
     }
 }
 
