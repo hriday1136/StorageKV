@@ -7,6 +7,7 @@ use crate::wal::Wal;
 use crate::record::{Kind, Record};
 use crate::sstable::{self, SSTable};
 use std::path::{Path, PathBuf};
+use crate::manifest::{Manifest, SstEntry};
 use std::fs;
 
 // Flush when the memtable exceeds this many bytes.
@@ -17,6 +18,7 @@ pub struct Db {
     wal: Wal,
     memtable: MemTable,
     sstables: Vec<SSTable>,
+    manifest: Manifest,
     next_seq: u64,
     next_sst_number: u64,
     flush_threshold: usize,
@@ -37,6 +39,7 @@ impl Db {
         sst_numbers.sort_unstable();
 
         let mut sstables =  Vec::new();
+        let manifest = Manifest::load(manifest_path(&dir))?;
         let mut max_seq = 0u64;
         for num in &sst_numbers {
             let sst = SSTable::open(sst_path(&dir, *num))?;
@@ -57,6 +60,7 @@ impl Db {
             wal,
             memtable,
             sstables,
+            manifest,
             next_seq: max_seq + 1,
             next_sst_number,
             flush_threshold: DEFAULT_FLUSH_THRESHOLD,
@@ -73,11 +77,18 @@ impl Db {
         let num = self.next_sst_number;
         let path = sst_path(&self.dir, num);
 
+        // SSTable Durable
         sstable::write_from_memtable(&path, &self.memtable)?;
-
         let sst = SSTable::open(&path)?;
+        let max_seq = sst.max_seq();
         self.sstables.push(sst);
         self.next_sst_number += 1;
+
+        // Recording in Manifest
+        self.manifest.ssts.push(SstEntry { number: num, max_seq });
+        self.manifest.next_sst = self.next_sst_number;
+        self.manifest.next_seq = self.next_seq;
+        self.manifest.save(manifest_path(&self.dir))?;
 
         self.wal.reset()?;
         self.memtable = MemTable::new();
@@ -135,6 +146,10 @@ fn wal_path(dir: &Path) -> PathBuf {
 
 fn sst_path(dir: &Path, num: u64) -> PathBuf {
     dir.join(format!("{:06}.sst", num))
+}
+
+fn manifest_path(dir: &Path) -> PathBuf {
+    dir.join("MANIFEST")
 }
 
 fn parse_sst_number(name: &str) -> Option<u64> {
