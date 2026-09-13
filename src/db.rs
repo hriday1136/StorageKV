@@ -25,47 +25,53 @@ pub struct Db {
 }
 
 impl Db {
+
+    /// Open a database directory, recovering to the exact committed pre-crash state.
+    ///
+    /// Recovery procedure (order matters):
+    ///   1. Load the MANIFEST — the authoritative set of live SSTables and the
+    ///      sequence/SSTable counters as of the last flush. A missing manifest
+    ///      means a brand-new database.
+    ///   2. Open exactly the SSTables the manifest names (oldest -> newest).
+    ///      Files on disk that the manifest does not list are NOT trusted.
+    ///   3. Replay the WAL on top. Its records are newer than any SSTable and
+    ///      advance the sequence counter past all recovered data.
+    ///   4. Delete crash litter (orphan .tmp files, .sst files not in the manifest)
+    ///      — only now, once the live set is known.
     pub fn open<P: AsRef<Path>>(dir: P) -> Result<Db> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
 
-        let mut sst_numbers: Vec<u64> = Vec::new();
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            if let Some(num) = parse_sst_number(&entry.file_name().to_string_lossy()) {
-                sst_numbers.push(num);
-            }
-        }
-        sst_numbers.sort_unstable();
-
-        let mut sstables =  Vec::new();
         let manifest = Manifest::load(manifest_path(&dir))?;
-        let mut max_seq = 0u64;
-        for num in &sst_numbers {
-            let sst = SSTable::open(sst_path(&dir, *num))?;
-            max_seq = max_seq.max(sst.max_seq());
+
+        let mut sstables = Vec::new();
+        for entry in &manifest.ssts {
+            let sst = SSTable::open(sst_path(&dir, entry.number))?;
             sstables.push(sst);
         }
-        let next_sst_number = sst_numbers.last().map_or(1, |n| n + 1);
+
+        let mut next_seq = manifest.next_seq;
+        let next_sst_number = manifest.next_sst;
 
         let wal = Wal::open(wal_path(&dir))?;
         let mut memtable = MemTable::new();
         for record in wal.replay()? {
-            max_seq = max_seq.max(record.seq);
+            next_seq = next_seq.max(record.seq + 1);
             memtable.apply(record);
         }
+
+        cleanup_orphans(&dir, &manifest.ssts)?;
 
         Ok(Db {
             dir,
             wal,
             memtable,
             sstables,
-            manifest,
-            next_seq: max_seq + 1,
+            next_seq,
             next_sst_number,
+            manifest,
             flush_threshold: DEFAULT_FLUSH_THRESHOLD,
         })
-
     }
 
      fn flush(&mut self) -> Result<()> {
@@ -138,6 +144,11 @@ impl Db {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    fn sstables_contains_number(&self, num: u64) -> bool {
+        self.manifest.ssts.iter().any(|e| e.number == num)
+    }
 }
 
 fn wal_path(dir: &Path) -> PathBuf {
@@ -155,6 +166,30 @@ fn manifest_path(dir: &Path) -> PathBuf {
 fn parse_sst_number(name: &str) -> Option<u64> {
     let stem = name.strip_suffix(".sst")?;
     stem.parse::<u64>().ok()
+}
+
+/// Remove crash litter
+fn cleanup_orphans(dir: &Path, live: &[SstEntry]) -> Result<()> {
+    let live_numbers: std::collections::HashSet<u64> = live.iter().map(|e| e.number).collect();
+
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+
+        let is_orphan = if name.ends_with(".tmp") {
+            true // any temp file is leftover from an interrupted atomic write
+        } else if let Some(num) = parse_sst_number(&name) {
+            !live_numbers.contains(&num) // an .sst not in the manifest
+        } else {
+            false
+        };
+
+        if is_orphan {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -254,6 +289,54 @@ mod tests {
 
         db.delete(b"k").unwrap();       // tombstone -> SSTable 3
         assert_eq!(db.get(b"k").unwrap(), None); // newest layer shadows both
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stray_sstable_not_in_manifest_is_ignored() {
+        let dir = temp_dir("stray");
+        {
+            let mut db = Db::open(&dir).unwrap();
+            db.flush_threshold = 256;
+            for i in 0..50u64 {
+                db.put(format!("key{:04}", i).as_bytes(), b"v").unwrap();
+            }
+        }
+        // Simulate crash litter: a plausible-looking SSTable the manifest never recorded.
+        // (Copy an existing real one to a high, unreferenced number.)
+        let real = sst_path(&dir, 1);
+        let stray = sst_path(&dir, 9999);
+        std::fs::copy(&real, &stray).unwrap();
+
+        // Recovery must ignore the stray file entirely — it isn't in the manifest.
+        let db = Db::open(&dir).unwrap();
+        assert!(!db.sstables_contains_number(9999), "stray SSTable must not be loaded");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_deletes_orphan_files() {
+        let dir = temp_dir("cleanup");
+        {
+            let mut db = Db::open(&dir).unwrap();
+            db.flush_threshold = 256;
+            for i in 0..50u64 {
+                db.put(format!("key{:04}", i).as_bytes(), b"v").unwrap();
+            }
+        }
+        // Plant crash litter: a stray .sst not in the manifest, and a .tmp file.
+        let stray_sst = sst_path(&dir, 9999);
+        std::fs::copy(sst_path(&dir, 1), &stray_sst).unwrap();
+        let stray_tmp = dir.join("000001.sst.tmp");
+        std::fs::write(&stray_tmp, b"garbage").unwrap();
+
+        // Reopen: recovery should delete both.
+        let _db = Db::open(&dir).unwrap();
+        assert!(!stray_sst.exists(), "orphan .sst should be deleted");
+        assert!(!stray_tmp.exists(), "orphan .tmp should be deleted");
+
+        // And a real, manifest-listed SSTable must survive.
+        assert!(sst_path(&dir, 1).exists(), "live SSTable must not be deleted");
         fs::remove_dir_all(&dir).unwrap();
     }
 }
