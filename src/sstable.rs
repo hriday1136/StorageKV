@@ -193,6 +193,21 @@ impl SSTable {
     pub fn max_seq(&self) -> u64 {
         self.max_seq
     }
+
+    /// Read every record in this table, in sorted key order.
+    /// Use by compaction to mereg tables. Reads the whole data section into memory.
+    pub fn records(&mut self) -> Result<Vec<Record>> {
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut data = vec![0u8; self.index_offset as usize];
+        self.file.read_exact(&mut data)?;
+
+        let mut out = Vec::new();
+        let mut cur = std::io::Cursor::new(data);
+        while let Some(rec) = Record::decode(&mut cur)? {
+            out.push(rec);
+        }
+        Ok(out)
+    }
 }
 
 

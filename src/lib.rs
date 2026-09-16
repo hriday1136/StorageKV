@@ -6,3 +6,4 @@ pub mod memtable;
 pub mod sstable;
 pub mod db;
 pub mod manifest;
+pub mod compaction;
