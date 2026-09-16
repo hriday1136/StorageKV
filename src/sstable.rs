@@ -15,6 +15,20 @@ const INDEX_INTERVAL: usize = 16; // sparse index interval, index every 16th rec
 
 // Flush a memtable to an SSTbale file at 'path', in sorted key order
 pub fn write_from_memtable<P: AsRef<Path>>(path: P, memtable: &MemTable) -> Result<()> {
+    let records: Vec<Record> = memtable
+        .iter()
+        .map(|(key, entry)| Record {
+            seq: entry.seq,
+            kind: entry.kind.clone(),
+            key: key.clone(),
+            value: entry.value.clone(),
+        })
+        .collect();
+    write_records(path, &records)
+}
+
+/// Write a sorted slice of records to an SSTable at `path`
+pub fn write_records<P: AsRef<Path>>(path: P, records: &[Record]) -> Result<()> {
     let path = path.as_ref();
     let tmp_path = tmp_path_for(path);
 
@@ -25,16 +39,10 @@ pub fn write_from_memtable<P: AsRef<Path>>(path: P, memtable: &MemTable) -> Resu
     let mut offset: u64 = 0;
     let mut count: u64 = 0;
 
-    for(i, (key, entry)) in memtable.iter().enumerate()  {
-        let record = Record {
-            seq: entry.seq,
-            kind: entry.kind.clone(),
-            key: key.clone(),
-            value: entry.value.clone(),
-        };
+    for (i, record) in records.iter().enumerate() {
         let bytes = record.encode();
         if i % INDEX_INTERVAL == 0 {
-            index.push((key.clone(), offset));
+            index.push((record.key.clone(), offset));
         }
         w.write_all(&bytes)?;
         offset += bytes.len() as u64;
@@ -61,9 +69,7 @@ pub fn write_from_memtable<P: AsRef<Path>>(path: P, memtable: &MemTable) -> Resu
     let file = w.into_inner().map_err(|e| Error::Io(e.into_error()))?;
     file.sync_all()?;
     drop(file);
-
     std::fs::rename(&tmp_path, path)?;
-
     fsync_dir(path)?;
     Ok(())
 }

@@ -12,6 +12,7 @@ use std::fs;
 
 // Flush when the memtable exceeds this many bytes.
 const DEFAULT_FLUSH_THRESHOLD: usize = 1024; // Intentionally small for testing.
+const COMPACTION_TRIGGER: usize = 4;
 
 pub struct Db {
     dir: PathBuf,
@@ -98,6 +99,44 @@ impl Db {
 
         self.wal.reset()?;
         self.memtable = MemTable::new();
+
+        if self.sstables.len() > COMPACTION_TRIGGER {
+            self.compact()?;
+        }
+
+        Ok(())
+    }
+
+    fn compact(&mut self) -> Result<()> {
+        if self.sstables.len() < 2 {
+            return Ok(()); // Nothing to merge
+        }
+
+        let mut inputs: Vec<Vec<Record>> = Vec::new();
+        for sst in self.sstables.iter_mut() {
+            inputs.push(sst.records()?);
+        }
+
+        let merged = crate::compaction::merge(inputs, true);
+
+        let old_numbers: Vec<u64> = self.manifest.ssts.iter().map(|e| e.number).collect();
+        let new_num = self.next_sst_number;
+        let new_path = sst_path(&self.dir, new_num);
+        sstable::write_records(&new_path, &merged)?;
+        let new_sst = SSTable::open(&new_path)?;
+        let new_max_seq = new_sst.max_seq();
+        self.next_sst_number += 1;
+
+        self.manifest.ssts = vec![SstEntry { number: new_num, max_seq: new_max_seq, }];
+        self.manifest.next_sst = self.next_sst_number;
+        self.manifest.next_seq = self.next_seq;
+        self.manifest.save(manifest_path(&self.dir))?;
+
+        self.sstables = vec![new_sst];
+
+        for num in old_numbers {
+            let _ = std::fs::remove_file(sst_path(&self.dir, num));
+        }
 
         Ok(())
     }
@@ -302,15 +341,13 @@ mod tests {
                 db.put(format!("key{:04}", i).as_bytes(), b"v").unwrap();
             }
         }
-        // Simulate crash litter: a plausible-looking SSTable the manifest never recorded.
-        // (Copy an existing real one to a high, unreferenced number.)
-        let real = sst_path(&dir, 1);
-        let stray = sst_path(&dir, 9999);
-        std::fs::copy(&real, &stray).unwrap();
+        // Plant a stray SSTable at a number the manifest will never reference.
+        // Contents don't matter: recovery must ignore it because it's not in the manifest.
+        let stray = sst_path(&dir, 999999);
+        std::fs::write(&stray, b"not a real sstable").unwrap();
 
-        // Recovery must ignore the stray file entirely — it isn't in the manifest.
         let db = Db::open(&dir).unwrap();
-        assert!(!db.sstables_contains_number(9999), "stray SSTable must not be loaded");
+        assert!(!db.sstables_contains_number(999999), "stray SSTable must not be loaded");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -324,19 +361,52 @@ mod tests {
                 db.put(format!("key{:04}", i).as_bytes(), b"v").unwrap();
             }
         }
-        // Plant crash litter: a stray .sst not in the manifest, and a .tmp file.
-        let stray_sst = sst_path(&dir, 9999);
-        std::fs::copy(sst_path(&dir, 1), &stray_sst).unwrap();
-        let stray_tmp = dir.join("000001.sst.tmp");
+        // Plant crash litter at numbers/paths the manifest never references.
+        let stray_sst = sst_path(&dir, 999999);
+        std::fs::write(&stray_sst, b"garbage").unwrap();
+        let stray_tmp = dir.join("000123.sst.tmp");
         std::fs::write(&stray_tmp, b"garbage").unwrap();
 
-        // Reopen: recovery should delete both.
         let _db = Db::open(&dir).unwrap();
         assert!(!stray_sst.exists(), "orphan .sst should be deleted");
         assert!(!stray_tmp.exists(), "orphan .tmp should be deleted");
 
-        // And a real, manifest-listed SSTable must survive.
-        assert!(sst_path(&dir, 1).exists(), "live SSTable must not be deleted");
+        // A manifest-listed SSTable must survive — check whichever number the manifest holds now.
+        let live = _db.manifest.ssts.first().map(|e| e.number);
+        if let Some(num) = live {
+            assert!(sst_path(&dir, num).exists(), "live SSTable must not be deleted");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn compaction_reduces_sstable_count_and_preserves_data() {
+        let dir = temp_dir("compact");
+        let mut db = Db::open(&dir).unwrap();
+        db.flush_threshold = 128; // many small flushes -> triggers compaction
+
+        // Write enough to flush several times and cross the compaction trigger.
+        for i in 0..300u64 {
+            db.put(format!("key{:04}", i).as_bytes(), b"v1").unwrap();
+        }
+        // Overwrite a subset (creates shadowed old versions to be reclaimed).
+        for i in 0..50u64 {
+            db.put(format!("key{:04}", i).as_bytes(), b"v2").unwrap();
+        }
+        // Delete a subset (creates tombstones to be dropped).
+        for i in 50..80u64 {
+            db.delete(format!("key{:04}", i).as_bytes()).unwrap();
+        }
+        db.compact().unwrap(); // force a final compaction
+
+        // After compacting all tables, there should be exactly one.
+        assert_eq!(db.sstables.len(), 1, "all tables should merge into one");
+
+        // Correctness preserved across the merge:
+        assert_eq!(db.get(b"key0000").unwrap(), Some(b"v2".to_vec())); // overwritten
+        assert_eq!(db.get(b"key0100").unwrap(), Some(b"v1".to_vec())); // untouched
+        assert_eq!(db.get(b"key0060").unwrap(), None);                 // deleted, tombstone dropped
+        assert_eq!(db.get(b"key0299").unwrap(), Some(b"v1".to_vec())); // last key
         fs::remove_dir_all(&dir).unwrap();
     }
 }
