@@ -409,4 +409,62 @@ mod tests {
         assert_eq!(db.get(b"key0299").unwrap(), Some(b"v1".to_vec())); // last key
         fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn crash_after_new_table_before_manifest_swap_recovers() {
+        // Window (a): the merged table exists on disk, but the manifest was never
+        // updated to reference it (crash before manifest.save). Recovery must fall
+        // back to the OLD tables the manifest still names, lose nothing, and treat
+        // the new table as orphan litter.
+        let dir = temp_dir("crash_pre_manifest");
+        {
+            let mut db = Db::open(&dir).unwrap();
+            db.flush_threshold = 128;
+            for i in 0..200u64 {
+                db.put(format!("key{:04}", i).as_bytes(), b"v1").unwrap();
+            }
+            // Do NOT compact. Manifest currently names several small tables.
+        }
+
+        // Simulate the crash-window litter: a plausible new merged table at the next
+        // number, which the manifest does not reference.
+        let orphan_new = sst_path(&dir, 999999);
+        std::fs::write(&orphan_new, b"partial merged table (not in manifest)").unwrap();
+
+        // Recover: must ignore the orphan and read all data from the real tables.
+        let mut db = Db::open(&dir).unwrap();
+        for i in 0..200u64 {
+            assert_eq!(db.get(format!("key{:04}", i).as_bytes()).unwrap(), Some(b"v1".to_vec()));
+        }
+        assert!(!orphan_new.exists(), "orphan merged table should be cleaned up");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn crash_after_manifest_swap_before_old_delete_recovers() {
+        // Window (b): compaction completed the manifest swap (new table is now
+        // authoritative) but crashed before deleting the old files. Recovery must
+        // use the new table, read everything, and clean up the leftover old files.
+        let dir = temp_dir("crash_post_manifest");
+        let mut db = Db::open(&dir).unwrap();
+        db.flush_threshold = 128;
+        for i in 0..200u64 {
+            db.put(format!("key{:04}", i).as_bytes(), b"v1").unwrap();
+        }
+        db.compact().unwrap(); // completes fully: new table + manifest + delete old
+
+        // Simulate a leftover old file that a crash would have prevented deleting:
+        // plant a stray .sst not referenced by the (post-compaction) manifest.
+        let leftover_old = sst_path(&dir, 999998);
+        std::fs::write(&leftover_old, b"old table that should have been deleted").unwrap();
+        drop(db); // "crash"
+
+        let mut db = Db::open(&dir).unwrap();
+        for i in 0..200u64 {
+            assert_eq!(db.get(format!("key{:04}", i).as_bytes()).unwrap(), Some(b"v1".to_vec()));
+        }
+        assert!(!leftover_old.exists(), "leftover old table should be cleaned up");
+        assert_eq!(db.sstables.len(), 1, "exactly the merged table remains");
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
