@@ -188,6 +188,12 @@ impl Db {
     fn sstables_contains_number(&self, num: u64) -> bool {
         self.manifest.ssts.iter().any(|e| e.number == num)
     }
+
+        /// Test/tuning hook: set the memtable flush threshold in bytes.
+    /// Exposed so tests can force frequent flushes and compaction.
+    pub fn set_flush_threshold_for_test(&mut self, bytes: usize) {
+        self.flush_threshold = bytes;
+    }
 }
 
 fn wal_path(dir: &Path) -> PathBuf {
