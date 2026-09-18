@@ -60,10 +60,10 @@ Deliberately scoped out of the core build, with the architecture designed to acc
 
 ## Building and running
 
-'''
+```
 cargo test # run all tests, including property tests
 cargo run --release --bin bench # run the benchmark harness
-'''
+```
 
 ## Design notes
 
